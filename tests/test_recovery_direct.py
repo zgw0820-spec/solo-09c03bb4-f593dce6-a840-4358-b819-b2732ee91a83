@@ -53,15 +53,19 @@ async def test_interrupted_post_that_gateway_accepted_is_not_reposted(tmp_path):
     _view, _deduplicated = service.submit_alarm(_payload("INT-1"))
     notification = db.query_one("SELECT * FROM notifications WHERE alarm_no = 'INT-1'")
 
-    # The gateway accepted, but the process died before recording it.
+    # The gateway accepted, but the process died before recording it. The
+    # gateway record must carry the exact same ownership identity as the API
+    # row, otherwise the receipt cannot be adopted.
+    import json as _json
+
     fake.deliver(
         {
             "notification_no": notification["notification_no"],
             "alarm_no": "INT-1",
             "role": "primary",
-            "contact": notification["contact_json"],
+            "contact": _json.loads(notification["contact_json"]),
             "content_hash": notification["content_hash"],
-            "payload": {},
+            "payload": _json.loads(notification["payload_json"]),
         }
     )
     db.execute("UPDATE notifications SET state = 'in_flight' WHERE id = ?", (notification["id"],))
@@ -94,6 +98,46 @@ async def test_interrupted_post_the_gateway_never_saw_is_reposted_once(tmp_path)
     assert row["state"] == "accepted"
     assert len(fake.role_notifications("primary")) == 1
     assert fake.post_calls >= 1
+
+
+async def test_recovery_with_foreign_same_number_record_is_terminal_conflict(tmp_path):
+    """The gateway holds the notification number for a different contact/body.
+    Recovery lookup must classify it as a conflict: no acceptance adopted, no
+    clock, and the number is not re-posted."""
+    import json as _json
+
+    fake = FakeGateway()
+    db, service, dispatcher = _build(tmp_path, fake)
+    service.submit_alarm(_payload("INT-CONF"))
+    notification = db.query_one("SELECT * FROM notifications WHERE alarm_no = 'INT-CONF'")
+
+    # Foreign record squatting the same number with different ownership.
+    fake.deliver(
+        {
+            "notification_no": notification["notification_no"],
+            "alarm_no": "INT-CONF",  # same alarm number, but contact and body differ
+            "role": "primary",
+            "contact": {"name": "无关联系人", "channel": "sms"},
+            "content_hash": "0" * 64,
+            "payload": {"content": "完全不同的正文"},
+        }
+    )
+    db.execute("UPDATE notifications SET state = 'in_flight' WHERE id = ?", (notification["id"],))
+    assert dispatcher.recover_interrupted() == 1
+
+    await _run(dispatcher, seconds=1.0)
+    row = db.query_one("SELECT * FROM notifications WHERE id = ?", (notification["id"],))
+    assert row["state"] == "conflicted"
+    assert row["gateway_status"] == "identity_conflict"
+    alarm = db.query_one("SELECT * FROM alarms WHERE alarm_no = 'INT-CONF'")
+    assert alarm["primary_accepted_real"] is None, "conflict must not start the clock"
+    # The only POST was the seed; the worker resolved via lookup and never
+    # re-posted the disputed number.
+    assert fake.post_calls == 0
+    assert fake.records[notification["notification_no"]]["contact"] == {
+        "name": "无关联系人",
+        "channel": "sms",
+    }
 
 
 async def test_recovery_is_idempotent_and_keeps_history_bounded(tmp_path):

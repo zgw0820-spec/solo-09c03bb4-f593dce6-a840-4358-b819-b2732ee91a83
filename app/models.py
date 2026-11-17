@@ -83,9 +83,16 @@ class NotificationView(BaseModel):
     notification_no: str
     role: Literal["primary", "backup"]
     contact: Contact
-    state: str = Field(description="pending | in_flight | unknown | accepted | failed | cancelled")
+    state: str = Field(
+        description=(
+            "pending | in_flight | unknown | accepted | failed | cancelled | conflicted"
+        )
+    )
     display_status: str = Field(
-        description="Operator-facing state: queued | sending | receipt_unconfirmed | accepted | rejected | cancelled_before_dispatch"
+        description=(
+            "queued | sending | receipt_unconfirmed | accepted | rejected | "
+            "cancelled_before_dispatch | identity_conflict"
+        )
     )
     display_text: str = Field(description="Human-readable Chinese status label")
     gateway_status: str | None = None
@@ -103,7 +110,8 @@ class AlarmView(BaseModel):
     status: str = Field(
         description=(
             "primary_queued | primary_sending | primary_unconfirmed | primary_rejected | "
-            "awaiting_confirmation | escalated | confirmed | confirmed_after_escalation"
+            "primary_conflict | awaiting_confirmation | escalated | confirmed | "
+            "confirmed_after_escalation"
         )
     )
     status_text: str = Field(description="Human-readable Chinese status label")

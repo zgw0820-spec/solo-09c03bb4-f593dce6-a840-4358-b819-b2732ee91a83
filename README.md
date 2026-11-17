@@ -65,6 +65,25 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 计时起点使用**网关记录的受理时间**，因此回执丢失或 API 重启后补查到的受理，
 其期限仍从真实受理时刻起算，不会凭空延长主值班员的处理窗口。
 
+### 2b. 通知号归属核对（同号异内容）
+
+通知号是网关的幂等键，但**同号不等于同一条通知**：编号由各 API 实例独立生成，
+数据库重建、号码复用或网关里存在外来记录时，同一通知号下可能是另一条告警
+（告警号、联系人、角色、内容指纹或正文不同）的受理记录。归属核对覆盖
+`alarm_no`、`role`、`contact`、`content_hash`、`payload` 五个字段：
+
+- **网关侧**：同号但身份不一致的 POST 一律返回 `409 identity_conflict`，
+  **不覆盖、不重复受理**原记录，并在响应中同时给出“网关持有”和“本次请求”的
+  身份与首个不一致字段；同号且身份完全一致才计为 `duplicate`，始终只投递一次。
+- **查询侧**：`GET /notifications/{no}` 支持携带期望身份参数，返回
+  `ownership=match|conflict` 并说明冲突字段；不带参数时行为与旧版一致。
+- **API 侧**：无论重投得到 409/`duplicate`，还是回执丢失后补查命中异内容记录，
+  都不会把它当成本告警的受理：通知进入终态 `conflicted`
+  （告警状态 `primary_conflict`），**不启动确认期限、不触发备班升级、不再重投
+  该号码**，并在 `warnings` 与事件流中说明冲突，等待人工核实。
+- 同号同内容的正常重试仍是幂等的：网关去重保证最多一次投递；回执丢失或
+  API 重启后按**原通知号**接续查询，身份一致才采纳受理并以网关受理时刻计时。
+
 ### 3. 逾期升级：仅一次
 
 后台 deadline 循环只做数据库操作、不发网络请求，因此网关再慢也不会推迟到期判断。
@@ -84,10 +103,13 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 
 ### 5. 重启接续
 
-- 重启时 `in_flight` 行（上一进程死在 POST 中）转为 `unknown`，先查网关再决定是否重投。
-- 若网关已受理，直接采纳受理结果，**不会重发**；若网关无记录，重投时通知号相同，
-  网关去重保证最多一次投递。
-- pending/未知回执、未确认告警的到期扫描都从数据库重建，无内存队列可丢。
+- 重启时 `in_flight` 行（上一进程死在 POST 中）转为 `unknown`，先带本通知的
+  期望身份查网关再决定是否重投。
+- 若网关已受理且**身份一致**，直接采纳受理结果，**不会重发**；若网关无记录，
+  重投时通知号相同，网关去重保证最多一次投递；若网关记录身份不一致，转为
+  终态 `conflicted`，不计时、不升级、不重投。
+- pending/未知回执、未确认告警的到期扫描都从数据库重建，无内存队列可丢；
+  `conflicted` 行持久化在库中，重启后仍为终态。
 
 ### 6. 慢投递不影响其他告警
 
@@ -108,15 +130,18 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 | GET | `/health` | 健康检查 |
 
 状态值：`primary_queued`、`primary_sending`、`primary_unconfirmed`、
-`primary_rejected`、`awaiting_confirmation`、`escalated`、`confirmed`、
-`confirmed_after_escalation`。
+`primary_rejected`、`primary_conflict`、`awaiting_confirmation`、`escalated`、
+`confirmed`、`confirmed_after_escalation`。
+
+通知明细状态：`pending`、`in_flight`、`unknown`、`accepted`、`failed`、
+`cancelled`、`conflicted`（终态：通知号归属冲突，不计时、不升级、不重投）。
 
 ## 通知网关（测试用）
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| POST | `/notifications` | 受理通知，按 `notification_no` 去重；重复请求返回 `{"status":"duplicate"}` |
-| GET | `/notifications/{no}` | 查询受理结果（回执丢失后的权威来源） |
+| POST | `/notifications` | 受理通知，按 `notification_no` 去重；同号同内容返回 `{"status":"duplicate"}`，同号异内容返回 `409 identity_conflict` 且不覆盖原记录 |
+| GET | `/notifications/{no}` | 查询受理结果（回执丢失后的权威来源）；带期望身份参数时返回 `ownership=match/conflict` |
 | GET | `/notifications` | 列出所有通知记录（`?role=&alarm_no=`） |
 | GET/PUT | `/config` | 运行时调整故障注入 |
 | DELETE | `/admin/reset` | 清空记录（测试便利） |
@@ -179,14 +204,16 @@ curl -s localhost:8000/alarms/DEMO-2 | python3 -m json.tool
 ## 测试
 
 ```bash
-python -m pytest -q                     # 27 个测试，进程内假网关，真实 SQLite 文件
+python -m pytest -q                     # 34 个测试，进程内假网关，真实 SQLite 文件
 API_URL=http://localhost:8000 GATEWAY_URL=http://localhost:9000 \
   python -I scripts/smoke_test.py       # 对真实运行的服务做端到端冒烟
 ```
 
 覆盖：幂等提交与 409、计时起点、确认阻断升级、逾期仅一次、回执不明不升级、
-回执补查不重复投递、重启接续（三种中断点）、确认 vs 到期竞态、慢投递不阻塞、
-拒收处理、在途备班如实披露、Swagger/OpenAPI。
+回执补查不重复投递、**通知号归属冲突（同号异内容：网关 409 不覆盖、API 终态
+不计时不升级不重投、查询说明冲突）**、同号同内容仍只投递一次、重启接续
+（三种中断点及冲突终态保持）、确认 vs 到期竞态、慢投递不阻塞、拒收处理、
+在途备班如实披露、Swagger/OpenAPI。
 
 ## 已知限制
 

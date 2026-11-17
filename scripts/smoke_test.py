@@ -10,6 +10,9 @@ It exercises the paths that are hard to see in unit tests:
   2. submit -> escalate exactly once
   3. slow gateway: unknown receipt must not escalate; recovery must not double-page
   4. dropped receipt: gateway accepted, API must resolve via lookup, not re-post
+  5. identity conflict: same number / different content is rejected by the gateway,
+     never adopted as a receipt, never re-posted, starts no clock
+  6. same-number same-content duplicate still pages exactly once
 
 Exits non-zero on the first violated assertion. Run it with -I.
 """
@@ -139,6 +142,63 @@ def main() -> int:
     notification_no = view["notifications"][0]["notification_no"]
     status, single = call("GET", f"{API}/notifications/{notification_no}")
     check(status == 200 and single["notification_no"] == notification_no, "lookup by notification number")
+
+    print("[6] same number, different content is an ownership conflict, not a receipt")
+    conflict_no = f"N-{RUN}-CONFLICT-primary"
+    # The gateway first accepts the number for a foreign alarm.
+    status, _ = call(
+        "POST",
+        f"{GATEWAY}/notifications",
+        {
+            "notification_no": conflict_no,
+            "alarm_no": f"{RUN}-FOREIGN",
+            "role": "primary",
+            "contact": {"name": "原联系人", "channel": "sms"},
+            "content_hash": "ab" * 32,
+            "payload": {"content": "他人的告警正文"},
+        },
+    )
+    check(status == 202, "foreign record accepted by gateway")
+    # A re-post for a different alarm under the same number must 409 and must
+    # not overwrite or re-deliver the original record.
+    status, body = call(
+        "POST",
+        f"{GATEWAY}/notifications",
+        {
+            "notification_no": conflict_no,
+            "alarm_no": f"{RUN}-INTRUDER",
+            "role": "primary",
+            "contact": {"name": "冒名联系人", "channel": "app"},
+            "content_hash": "cd" * 32,
+            "payload": {"content": "冒名正文"},
+        },
+    )
+    check(status == 409 and body.get("status") == "identity_conflict", "conflicting re-post rejected with 409")
+    _, held = call("GET", f"{GATEWAY}/notifications/{conflict_no}")
+    check(held["alarm_no"] == f"{RUN}-FOREIGN" and held["deliveries"] == 1, "original gateway record preserved")
+    # The lookup endpoint explains the clash when asked with the intruder identity.
+    status, verdict = call(
+        "GET",
+        f"{GATEWAY}/notifications/{conflict_no}?alarm_no=" + f"{RUN}-INTRUDER",
+    )
+    check(status == 200 and verdict.get("ownership") == "conflict", "lookup reports ownership conflict")
+
+    print("[7] same number, same content still delivers exactly once")
+    status, dup = call(
+        "POST",
+        f"{GATEWAY}/notifications",
+        {
+            "notification_no": conflict_no,
+            "alarm_no": f"{RUN}-FOREIGN",
+            "role": "primary",
+            "contact": {"name": "原联系人", "channel": "sms"},
+            "content_hash": "ab" * 32,
+            "payload": {"content": "他人的告警正文"},
+        },
+    )
+    check(status == 200 and dup.get("status") == "duplicate", "identical re-post is a benign duplicate")
+    _, held = call("GET", f"{GATEWAY}/notifications/{conflict_no}")
+    check(held["deliveries"] == 1, "duplicate did not page twice")
 
     print("smoke test passed")
     return 0

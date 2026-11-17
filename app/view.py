@@ -21,6 +21,7 @@ NOTIFICATION_DISPLAY = {
     "accepted": ("accepted", "网关已受理"),
     "failed": ("rejected", "网关拒收"),
     "cancelled": ("cancelled_before_dispatch", "未投递即取消"),
+    "conflicted": ("identity_conflict", "通知号归属冲突"),
 }
 
 ALARM_STATUS_TEXT = {
@@ -28,6 +29,7 @@ ALARM_STATUS_TEXT = {
     "primary_sending": "主通知发送中",
     "primary_unconfirmed": "主通知回执未确认，计时未开始",
     "primary_rejected": "主通知被网关拒收",
+    "primary_conflict": "主通知号归属冲突，计时未开始",
     "awaiting_confirmation": "主通知已受理，等待确认",
     "escalated": "逾期未确认，已通知备班",
     "confirmed": "已确认",
@@ -108,6 +110,8 @@ def build_alarm_view(
         status = "primary_sending" if primary["state"] == "in_flight" else "primary_queued"
     elif primary["state"] == "failed":
         status = "primary_rejected"
+    elif primary["state"] == "conflicted":
+        status = "primary_conflict"
     else:
         status = "primary_unconfirmed"
 
@@ -123,6 +127,16 @@ def build_alarm_view(
         warnings.append("主通知回执不明，正在向网关查询受理结果；查明前不会触发升级。")
     if primary is not None and primary["state"] == "failed":
         warnings.append("网关明确拒收主通知，系统不会自动重发，请人工核实主备联系人。")
+    if primary is not None and primary["state"] == "conflicted":
+        warnings.append(
+            "主通知号归属冲突：网关已存在相同通知号但告警号、联系人或正文不同的受理记录，"
+            "该记录不属于本告警；确认计时未开始、不会触发备班升级，系统不再重投该号码，请人工核实。"
+        )
+    if backup is not None and backup["state"] == "conflicted":
+        warnings.append(
+            "备班通知号归属冲突：网关在该号码下持有别的通知受理，不属于本告警，"
+            "系统不再重投该号码，请人工通知备班。"
+        )
     if backup is not None and backup["state"] in {"in_flight", "unknown"}:
         warnings.append("备班通知已提交且在途，受理结果正在向网关查明，请以查询结果为准。")
     if (

@@ -257,12 +257,23 @@ class Dispatcher:
         A definitive answer fixes the state. "Not found" means the gateway has no
         record of this notification, so re-posting is harmless: the notification
         number is the gateway's dedupe key, and a still-running first attempt
-        will win the insert. Anything else stays unknown and is retried on the
-        next tick; critically, no timer is started and no escalation is
-        triggered while the receipt is unknown.
+        will win the insert. A same-number record with different ownership is a
+        conflict, not a receipt: it is recorded as a terminal ``conflicted``
+        state, starts no clock, triggers no escalation and is never re-posted.
+        Anything else stays unknown and is retried on the next tick; critically,
+        no timer is started and no escalation is triggered while the receipt is
+        unknown.
         """
         self.lookup_attempts += 1
-        result = await self.gateway.lookup(row["notification_no"])
+        result = await self._lookup(row)
+        if result.outcome == "conflict":
+            self.service.mark_notification(
+                row["id"],
+                "conflicted",
+                result.gateway_status,
+                result.detail,
+            )
+            return
         if result.outcome == "failed" and result.gateway_status == "not_found":
             # The gateway has no record *yet*. It may simply still be processing
             # the original POST, so re-post only after repeated misses, with a
@@ -298,7 +309,28 @@ class Dispatcher:
             return
         await self._apply_result(row, result)
 
+    async def _lookup(self, row: dict[str, Any]) -> GatewayResult:
+        """Lookup with the full expected identity, so a same-number foreign
+        record is reported as a conflict instead of being mistaken for a
+        receipt."""
+        return await self.gateway.lookup(
+            row["notification_no"],
+            alarm_no=row["alarm_no"],
+            role=row["role"],
+            contact=_load(row["contact_json"], {}),
+            content_hash=row["content_hash"],
+            payload=_load(row["payload_json"], {}),
+        )
+
     async def _apply_result(self, row: dict[str, Any], result: GatewayResult) -> None:
+        if result.outcome == "conflict":
+            # A disputed number is terminal: the original gateway record is
+            # preserved by the gateway, and re-posting this number would only
+            # repeat the same 409. No clock starts and no escalation can follow.
+            self.service.mark_notification(
+                row["id"], "conflicted", result.gateway_status, result.detail
+            )
+            return
         if result.outcome in {"accepted", "duplicate"}:
             self.service.mark_notification(
                 row["id"],
@@ -364,7 +396,17 @@ class Dispatcher:
             return 0
 
         results = await asyncio.gather(
-            *(self.gateway.lookup(dict(row)["notification_no"]) for row in rows)
+            *(
+                self.gateway.lookup(
+                    dict(row)["notification_no"],
+                    alarm_no=dict(row)["alarm_no"],
+                    role=dict(row)["role"],
+                    contact=_load(dict(row)["contact_json"], {}),
+                    content_hash=dict(row)["content_hash"],
+                    payload=_load(dict(row)["payload_json"], {}),
+                )
+                for row in rows
+            )
         )
         resolved = 0
         for raw, result in zip(rows, results):
@@ -380,6 +422,15 @@ class Dispatcher:
                 continue
             if result.outcome == "failed" and result.gateway_status == "not_found":
                 continue  # the dispatch loop owns re-posting
+            if result.outcome == "conflict":
+                self.service.mark_notification(
+                    row["id"],
+                    "conflicted",
+                    result.gateway_status,
+                    result.detail,
+                )
+                resolved += 1
+                continue
             if result.outcome in {"accepted", "duplicate"}:
                 self.service.mark_notification(
                     row["id"],

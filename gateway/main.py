@@ -3,9 +3,15 @@
 It behaves like a real paging gateway:
 
 * ``POST /notifications`` accepts a notification idempotently on
-  ``notification_no``. Re-posting the same number never pages twice.
+  ``notification_no``, but only when the whole notification identity matches
+  (alarm number, role, contact, content hash and payload). Re-posting the same
+  number with the same content never pages twice; a same-number request whose
+  identity differs is rejected with ``409 identity_conflict`` and the stored
+  record is never overwritten or paged again.
 * ``GET /notifications/{no}`` reports the authoritative receipt, which lets the
-  API resolve a lost acknowledgment without resending.
+  API resolve a lost acknowledgment without resending. Supplying the expected
+  identity adds an ``ownership`` verdict (``match``/``conflict``) so a foreign
+  same-number record can never be mistaken for the caller's receipt.
 * Failure modes are configurable at runtime, via env or ``PUT /config``:
 
   - ``slow_ms``: delay before the notification is accepted. If the caller's
@@ -30,6 +36,13 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
+
+from app.identity import (
+    describe_mismatch,
+    expected_identity,
+    identity_mismatch,
+    record_identity,
+)
 
 
 class NotificationIn(BaseModel):
@@ -79,13 +92,45 @@ class GatewayState:
         tmp.write_text(json.dumps({"records": self.records}, ensure_ascii=False, indent=2), "utf-8")
         os.replace(tmp, target)
 
-    def deliver(self, payload: NotificationIn) -> tuple[bool, dict[str, Any]]:
-        """Return (created, record). Idempotent on notification number."""
+    def deliver(self, payload: NotificationIn) -> tuple[str, dict[str, Any]]:
+        """Idempotent on notification number *with ownership verification*.
+
+        Returns ``(outcome, record)`` where outcome is one of:
+
+        * ``created``  — the number was unknown and has now been recorded;
+        * ``duplicate`` — the number exists and belongs to the same notification
+          (identical alarm number, role, contact, content hash and payload);
+        * ``conflict``  — the number exists but belongs to a different
+          notification. The stored record is never overwritten or paged again.
+        """
         existing = self.records.get(payload.notification_no)
         if existing is not None:
+            mismatch = identity_mismatch(
+                expected_identity(
+                    alarm_no=payload.alarm_no,
+                    role=payload.role,
+                    contact=payload.contact,
+                    content_hash=payload.content_hash,
+                    payload=payload.payload,
+                ),
+                record_identity(existing),
+            )
+            if mismatch is not None:
+                existing["conflict_requests"] = existing.get("conflict_requests", 0) + 1
+                existing.setdefault("conflicts", []).append(
+                    {
+                        "at": _now(),
+                        "alarm_no": payload.alarm_no,
+                        "role": payload.role,
+                        "content_hash": payload.content_hash,
+                        "mismatched_field": mismatch["field"],
+                    }
+                )
+                self._save()
+                return "conflict", existing
             existing["duplicate_requests"] += 1
             self._save()
-            return False, existing
+            return "duplicate", existing
         record = {
             "notification_no": payload.notification_no,
             "alarm_no": payload.alarm_no,
@@ -96,11 +141,12 @@ class GatewayState:
             "status": "accepted",
             "deliveries": 1,
             "duplicate_requests": 0,
+            "conflict_requests": 0,
             "accepted_at": _now(),
         }
         self.records[payload.notification_no] = record
         self._save()
-        return True, record
+        return "created", record
 
 
 _STATE: GatewayState | None = None
@@ -129,7 +175,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="本地通知网关（测试用）",
     version="1.0.0",
-    description="可按通知号去重、可设置慢响应/丢回执的本地通知网关。",
+    description=(
+        "可按通知号去重、可设置慢响应/丢回执的本地通知网关。\n\n"
+        "同号且身份（告警号、角色、联系人、内容指纹、正文）完全一致才视为重复；"
+        "同号异内容返回 409 identity_conflict 且不覆盖原记录。"
+        "GET 查询携带期望身份时返回 ownership=match/conflict。"
+    ),
     lifespan=lifespan,
 )
 
@@ -179,17 +230,59 @@ async def accept_notification(payload: NotificationIn, response: Response) -> di
     if config.drop_receipt:
         # The notification is now accepted and durable, but the caller never
         # learns that. Hold the connection past any reasonable client timeout.
+        # A conflicting re-post never reaches here: conflicts are decided before
+        # the receipt-drop simulation and answered immediately.
         await asyncio.sleep(config.drop_hold_ms / 1000)
         response.status_code = status.HTTP_504_GATEWAY_TIMEOUT
         return {"status": "receipt_lost"}
 
-    if not created:
+    if created == "conflict":
+        # Same number, different notification. The original record is untouched
+        # and must not be paged again; tell the caller precisely what differs.
+        mismatch = identity_mismatch(
+            expected_identity(
+                alarm_no=payload.alarm_no,
+                role=payload.role,
+                contact=payload.contact,
+                content_hash=payload.content_hash,
+                payload=payload.payload,
+            ),
+            record_identity(record),
+        )
+        response.status_code = status.HTTP_409_CONFLICT
+        return {
+            "status": "identity_conflict",
+            "notification_no": record["notification_no"],
+            "detail": describe_mismatch(mismatch),
+            "mismatched_field": mismatch["field"] if mismatch else None,
+            "held": {
+                "alarm_no": record.get("alarm_no"),
+                "role": record.get("role"),
+                "contact": record.get("contact"),
+                "content_hash": record.get("content_hash"),
+                "payload": record.get("payload"),
+            },
+            "received": {
+                "alarm_no": payload.alarm_no,
+                "role": payload.role,
+                "contact": payload.contact,
+                "content_hash": payload.content_hash,
+                "payload": payload.payload,
+            },
+        }
+
+    if created == "duplicate":
         response.status_code = status.HTTP_200_OK
         return {
             "status": "duplicate",
             "notification_no": record["notification_no"],
             "accepted_at": record["accepted_at"],
             "deliveries": record["deliveries"],
+            "alarm_no": record["alarm_no"],
+            "role": record["role"],
+            "contact": record["contact"],
+            "content_hash": record["content_hash"],
+            "payload": record["payload"],
         }
     return {
         "status": "accepted",
@@ -200,11 +293,57 @@ async def accept_notification(payload: NotificationIn, response: Response) -> di
 
 
 @app.get("/notifications/{notification_no}")
-async def lookup(notification_no: str) -> dict[str, Any]:
+async def lookup(
+    notification_no: str,
+    alarm_no: str | None = None,
+    role: str | None = None,
+    contact: str | None = None,
+    content_hash: str | None = None,
+    payload: str | None = None,
+) -> dict[str, Any]:
+    """Report the authoritative record for a notification number.
+
+    When the caller supplies its expected identity (the API always does), the
+    response additionally carries an ``ownership`` verdict:
+
+    * ``match``    — the stored record is this exact notification;
+    * ``conflict`` — the same number is held by a different notification. The
+      record is returned unchanged so the caller can disclose the clash, but it
+      must not adopt its acceptance or re-post the number.
+
+    Without identity parameters the endpoint behaves exactly as before.
+    """
     record = state().records.get(notification_no)
     if record is None:
         raise HTTPException(status_code=404, detail="unknown notification")
-    return record
+
+    if alarm_no is None and role is None and content_hash is None and contact is None and payload is None:
+        return record
+
+    import json as _json
+
+    try:
+        expected_contact = _json.loads(contact) if contact is not None else None
+        expected_payload = _json.loads(payload) if payload is not None else {}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="contact/payload must be JSON-encoded") from None
+
+    expected = expected_identity(
+        alarm_no=alarm_no or "",
+        role=role or "",
+        contact=expected_contact,
+        content_hash=content_hash,
+        payload=expected_payload,
+    )
+    mismatch = identity_mismatch(expected, record_identity(record))
+    if mismatch is None:
+        return {**record, "ownership": "match"}
+    return {
+        **record,
+        "ownership": "conflict",
+        "ownership_detail": describe_mismatch(mismatch),
+        "mismatched_field": mismatch["field"],
+    }
 
 
 @app.get("/notifications")

@@ -60,8 +60,11 @@ CREATE TABLE IF NOT EXISTS notifications (
     -- accepted  : gateway confirmed acceptance
     -- failed    : gateway definitively rejected (no blind retry)
     -- cancelled : confirmation arrived before this backup was dispatched
+    -- conflicted: gateway holds this number for a different notification;
+    --              terminal: never re-posted, starts no clock, cannot escalate
     state              TEXT NOT NULL CHECK (
-                           state IN ('pending','in_flight','unknown','accepted','failed','cancelled')
+                           state IN ('pending','in_flight','unknown','accepted',
+                                     'failed','cancelled','conflicted')
                        ),
     gateway_status     TEXT,
     detail             TEXT,
@@ -127,6 +130,78 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE notifications ADD COLUMN lookup_misses INTEGER NOT NULL DEFAULT 0"
             )
+        # Older builds' CHECK constraint does not allow the terminal
+        # "conflicted" state. SQLite cannot alter a CHECK in place, so rebuild
+        # the table once, preserving every row and the attached indexes.
+        allowed = {
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='notifications'"
+            ).fetchone()
+        }
+        if allowed and "conflicted" not in " ".join(allowed):
+            self._rebuild_notifications_table()
+
+    def _rebuild_notifications_table(self) -> None:
+        columns = [
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(notifications)").fetchall()
+        ]
+        column_list = ", ".join(columns)
+        with self._lock:
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(
+                    """
+                    CREATE TABLE notifications_new (
+                        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                        alarm_no           TEXT NOT NULL REFERENCES alarms(alarm_no),
+                        notification_no    TEXT NOT NULL UNIQUE,
+                        role               TEXT NOT NULL CHECK (role IN ('primary', 'backup')),
+                        contact_json       TEXT NOT NULL,
+                        content_hash       TEXT NOT NULL,
+                        payload_json       TEXT NOT NULL,
+                        created_at         TEXT NOT NULL,
+                        created_real       REAL NOT NULL,
+                        state              TEXT NOT NULL CHECK (
+                                               state IN ('pending','in_flight','unknown','accepted',
+                                                         'failed','cancelled','conflicted')
+                                           ),
+                        gateway_status     TEXT,
+                        detail             TEXT,
+                        attempts           INTEGER NOT NULL DEFAULT 0,
+                        lookup_misses      INTEGER NOT NULL DEFAULT 0,
+                        created_by         TEXT NOT NULL,
+                        history_json       TEXT NOT NULL DEFAULT '[]',
+                        accepted_at        TEXT,
+                        accepted_real      REAL,
+                        last_attempt_at    TEXT,
+                        lease_until        REAL,
+                        next_attempt_at    REAL
+                    )
+                    """
+                )
+                self._conn.execute(
+                    f"INSERT INTO notifications_new ({column_list}) "
+                    f"SELECT {column_list} FROM notifications"
+                )
+                self._conn.execute("DROP TABLE notifications")
+                self._conn.execute("ALTER TABLE notifications_new RENAME TO notifications")
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_notifications_alarm_role "
+                    "ON notifications(alarm_no, role)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_notifications_due "
+                    "ON notifications(state, next_attempt_at)"
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            finally:
+                self._conn.execute("PRAGMA foreign_keys=ON")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

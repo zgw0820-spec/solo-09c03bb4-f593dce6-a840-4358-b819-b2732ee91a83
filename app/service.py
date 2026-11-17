@@ -437,11 +437,13 @@ class AlarmService:
             next_attempt_at = None
             if state in {"pending", "unknown", "in_flight"}:
                 next_attempt_at = retry_at if retry_at is not None else parse_ts(now)
+            # A conflict is terminal: no next attempt means the dispatcher never
+            # picks the row up again, so the disputed number is not re-posted.
 
             if lookup_miss:
                 lookup_misses = row["lookup_misses"] + 1
-            elif state in {"accepted", "pending", "failed"}:
-                # A fresh post or a resolution resets the miss counter.
+            elif state in {"accepted", "pending", "failed", "conflicted"}:
+                # A fresh post, a resolution, or a conflict resets the miss counter.
                 lookup_misses = 0
             else:
                 lookup_misses = row["lookup_misses"]
@@ -507,6 +509,16 @@ class AlarmService:
                     row["alarm_no"],
                     f"{row['role']}_rejected",
                     f"{row['notification_no']}: {detail}",
+                )
+            elif state == "conflicted":
+                # Terminal ownership clash: the gateway record under this number
+                # belongs to another notification. No clock starts, no
+                # escalation follows, and the number is never re-posted.
+                self._event(
+                    conn,
+                    row["alarm_no"],
+                    f"{row['role']}_identity_conflict",
+                    f"{row['notification_no']}: {detail} (no escalation timer change; number not re-posted)",
                 )
             elif state == "unknown":
                 self._event(

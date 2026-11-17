@@ -10,6 +10,9 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY gateway ./gateway
+# The gateway shares notification-ownership verification with the API
+# (app/identity.py), so the shared package must be present in this image too.
+COPY app ./app
 
 RUN mkdir -p /srv/data
 ENV GATEWAY_STATE_PATH=/srv/data/gateway.json
