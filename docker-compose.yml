@@ -1,0 +1,52 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    environment:
+      # Defaults are a healthy gateway; override at runtime via PUT /config.
+      GATEWAY_SLOW_MS: "0"
+      GATEWAY_DROP_RECEIPT: "0"
+      GATEWAY_REJECT: "0"
+      GATEWAY_STATE_PATH: /srv/data/gateway.json
+    volumes:
+      - gateway-data:/srv/data
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_PATH: /srv/data/alarms.db
+      GATEWAY_URL: http://gateway:9000
+      # Keep the POST timeout below the gateway's slow-response injection so
+      # the "receipt lost" path is reachable during manual testing.
+      GATEWAY_TIMEOUT_SECONDS: "2.0"
+      GATEWAY_LOOKUP_TIMEOUT_SECONDS: "1.0"
+      WORKER_INTERVAL_SECONDS: "0.1"
+      DELIVERY_LEASE_SECONDS: "10"
+      RECONCILE_ON_READ: "true"
+      LOG_LEVEL: info
+    volumes:
+      - api-data:/srv/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  api-data:
+  gateway-data:
